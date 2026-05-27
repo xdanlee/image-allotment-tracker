@@ -74,6 +74,9 @@ const EMPTY_ROW = {
   verified: "",
 };
 
+const EXPECTED_IMAGES_PER_FILE = 100;
+const EXPECTED_FILES_PER_BATCH = 5;
+
 function parseImages(value) {
   const matches = String(value || "").match(/\d+/g);
   return matches ? matches.map(Number) : [];
@@ -351,6 +354,81 @@ function buildPerspectiveStats(records, perspective) {
   return [...groups.values()].sort((a, b) => a.label.localeCompare(b.label));
 }
 
+function buildCoverage(records, rows) {
+  const files = new Map();
+  const batches = new Map();
+
+  rows.forEach((row) => {
+    if (!row.batchNo || !row.fileNo) return;
+    const batchNo = row.batchNo;
+    const fileNo = row.fileNo;
+    const key = `${batchNo}::${fileNo}`;
+    if (!files.has(key)) {
+      files.set(key, {
+        key,
+        batchNo,
+        fileNo,
+        images: new Set(),
+      });
+    }
+    const fileSet = batches.get(batchNo) || new Set();
+    fileSet.add(fileNo);
+    batches.set(batchNo, fileSet);
+  });
+
+  records.forEach((record) => {
+    const key = `${record.batchNo}::${record.fileNo}`;
+    const file =
+      files.get(key) ||
+      {
+        key,
+        batchNo: record.batchNo,
+        fileNo: record.fileNo,
+        images: new Set(),
+      };
+    file.images.add(record.imageNumber);
+    files.set(key, file);
+  });
+
+  const fileCoverage = [...files.values()]
+    .map((file) => {
+      const present = [...file.images].filter((imageNumber) => imageNumber >= 1 && imageNumber <= EXPECTED_IMAGES_PER_FILE);
+      const missing = [];
+      for (let imageNumber = 1; imageNumber <= EXPECTED_IMAGES_PER_FILE; imageNumber += 1) {
+        if (!file.images.has(imageNumber)) missing.push(imageNumber);
+      }
+      const outOfRange = [...file.images].filter(
+        (imageNumber) => imageNumber < 1 || imageNumber > EXPECTED_IMAGES_PER_FILE
+      );
+
+      return {
+        ...file,
+        present: present.length,
+        missing,
+        outOfRange,
+        coveragePercent: Math.round((present.length / EXPECTED_IMAGES_PER_FILE) * 100),
+      };
+    })
+    .sort((a, b) => a.batchNo.localeCompare(b.batchNo) || Number(a.fileNo) - Number(b.fileNo));
+
+  const batchCoverage = [...batches.entries()]
+    .map(([batchNo, fileSet]) => {
+      const numericFiles = [...fileSet].map(Number).filter(Number.isFinite);
+      const missingFiles = [];
+      for (let fileNo = 1; fileNo <= EXPECTED_FILES_PER_BATCH; fileNo += 1) {
+        if (!numericFiles.includes(fileNo)) missingFiles.push(fileNo);
+      }
+      return {
+        batchNo,
+        filesPresent: fileSet.size,
+        missingFiles,
+      };
+    })
+    .sort((a, b) => a.batchNo.localeCompare(b.batchNo));
+
+  return { fileCoverage, batchCoverage };
+}
+
 function BrandMark() {
   return (
     <div className="relative h-12 w-12 shrink-0 overflow-hidden rounded-full border border-slate-950 bg-white shadow-sm">
@@ -612,6 +690,7 @@ export default function Home() {
   const qaStats = useMemo(() => getQaStats(enrichedRows), [enrichedRows]);
   const fileProgress = useMemo(() => buildFileProgress(imageRecords), [imageRecords]);
   const hierarchy = useMemo(() => buildHierarchy(uniqueImageRecords), [uniqueImageRecords]);
+  const coverage = useMemo(() => buildCoverage(uniqueImageRecords, enrichedRows), [enrichedRows, uniqueImageRecords]);
   const perspectiveStats = useMemo(
     () => buildPerspectiveStats(uniqueImageRecords, statsPerspective),
     [statsPerspective, uniqueImageRecords]
@@ -877,6 +956,7 @@ export default function Home() {
             qaFlags={qaFlags}
             setFilters={setFilters}
             fileProgress={fileProgress}
+            coverage={coverage}
             workerProgress={workerProgress}
           />
         )}
@@ -884,6 +964,7 @@ export default function Home() {
         {activeTab === "hierarchy" && (
           <HierarchyTab
             hierarchy={hierarchy}
+            coverage={coverage}
             perspectiveStats={perspectiveStats}
             setStatsPerspective={setStatsPerspective}
             statsPerspective={statsPerspective}
@@ -895,6 +976,7 @@ export default function Home() {
             adminToken={adminToken}
             commitCleanupRows={commitCleanupRows}
             crossRowIssues={crossRowIssues}
+            coverage={coverage}
             normalizeAllRows={normalizeAllRows}
             pendingCleanupCount={pendingCleanupIds.size}
             qaFlags={qaFlags}
@@ -929,7 +1011,7 @@ export default function Home() {
   );
 }
 
-function TrackerTab({ fileProgress, filteredRecords, filters, kpis, loading, qaFlags, qaStats, setFilters, workerProgress }) {
+function TrackerTab({ coverage, fileProgress, filteredRecords, filters, kpis, loading, qaFlags, qaStats, setFilters, workerProgress }) {
   const kpiCards = [
     { label: "Total Images", value: kpis.total, icon: ClipboardList, tone: "border-slate-200" },
     { label: "Assigned", value: kpis.assigned, icon: ClipboardList, tone: "border-slate-300" },
@@ -982,8 +1064,11 @@ function TrackerTab({ fileProgress, filteredRecords, filters, kpis, loading, qaF
           { label: "Multi-stage Images", value: qaStats.multipleQueues },
           { label: "Queue Duplicates", value: qaStats.duplicateWithinQueue },
           { label: "Cross-row Conflicts", value: qaStats.crossRowDuplicates },
+          {
+            label: "Missing Images",
+            value: coverage.fileCoverage.reduce((total, file) => total + file.missing.length, 0),
+          },
           { label: "Inherited Worker Rows", value: qaStats.inheritedWorkerRows },
-          { label: "Blank Rows", value: qaStats.blankRows },
         ].map((item) => (
           <div key={item.label} className="rounded-md border border-amber-200 bg-amber-50 p-4">
             <p className="text-sm font-medium text-amber-800">{item.label}</p>
@@ -1071,6 +1156,8 @@ function TrackerTab({ fileProgress, filteredRecords, filters, kpis, loading, qaF
           </table>
         </div>
       </section>
+
+      <CoverageSection coverage={coverage} />
 
       <section className="rounded-md border border-slate-200 bg-white shadow-panel">
         <div className="flex flex-col gap-4 border-b border-slate-200 px-4 py-4">
@@ -1168,7 +1255,7 @@ function TrackerTab({ fileProgress, filteredRecords, filters, kpis, loading, qaF
   );
 }
 
-function HierarchyTab({ hierarchy, perspectiveStats, setStatsPerspective, statsPerspective }) {
+function HierarchyTab({ coverage, hierarchy, perspectiveStats, setStatsPerspective, statsPerspective }) {
   return (
     <div className="space-y-6">
       <section className="rounded-md border border-slate-200 bg-white shadow-panel">
@@ -1266,7 +1353,76 @@ function HierarchyTab({ hierarchy, perspectiveStats, setStatsPerspective, statsP
           </table>
         </div>
       </section>
+
+      <CoverageSection coverage={coverage} />
     </div>
+  );
+}
+
+function CoverageSection({ coverage }) {
+  const totalMissing = coverage.fileCoverage.reduce((total, file) => total + file.missing.length, 0);
+
+  return (
+    <section className="rounded-md border border-slate-200 bg-white shadow-panel">
+      <SectionHeader
+        eyebrow={`${EXPECTED_IMAGES_PER_FILE} images expected per file`}
+        title="File Coverage"
+        action={<span className="rounded-full bg-slate-100 px-3 py-1 text-sm font-medium text-slate-700">{totalMissing} missing</span>}
+      />
+      <div className="overflow-x-auto">
+        <table className="min-w-full divide-y divide-slate-200 text-sm">
+          <thead className="bg-slate-50 text-left text-xs font-semibold uppercase text-slate-500">
+            <tr>
+              {["Batch", "File", "Coverage", "Present", "Missing Count", "Missing Images", "Out of Range"].map((heading) => (
+                <th key={heading} className="px-4 py-3">
+                  {heading}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-slate-100">
+            {coverage.fileCoverage.map((file) => (
+              <tr key={file.key}>
+                <td className="px-4 py-3 font-medium text-slate-900">{file.batchNo}</td>
+                <td className="px-4 py-3">{file.fileNo}</td>
+                <td className="px-4 py-3">
+                  <div className="flex min-w-40 items-center gap-3">
+                    <div className="h-2 flex-1 rounded-full bg-slate-100">
+                      <div className="h-2 rounded-full bg-emerald-500" style={{ width: `${file.coveragePercent}%` }} />
+                    </div>
+                    <span className="w-10 text-right text-slate-600">{file.coveragePercent}%</span>
+                  </div>
+                </td>
+                <td className="px-4 py-3">{file.present}/100</td>
+                <td className="px-4 py-3">{file.missing.length}</td>
+                <td className="max-w-md px-4 py-3 text-slate-600">
+                  {file.missing.length ? file.missing.join(", ") : "None"}
+                </td>
+                <td className="px-4 py-3 text-slate-600">{file.outOfRange.length ? file.outOfRange.join(", ") : "None"}</td>
+              </tr>
+            ))}
+            {coverage.fileCoverage.length === 0 && (
+              <tr>
+                <td className="px-4 py-8 text-center text-slate-500" colSpan={7}>
+                  No file rows found.
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+      <div className="border-t border-slate-200 px-4 py-3">
+        <p className="text-sm font-medium text-slate-700">Batch file coverage</p>
+        <div className="mt-2 flex flex-wrap gap-2">
+          {coverage.batchCoverage.map((batch) => (
+            <span key={batch.batchNo} className="rounded-full bg-slate-100 px-3 py-1 text-sm text-slate-700">
+              Batch {batch.batchNo}: {batch.filesPresent}/{EXPECTED_FILES_PER_BATCH} files
+              {batch.missingFiles.length ? `, missing files ${batch.missingFiles.join(", ")}` : ""}
+            </span>
+          ))}
+        </div>
+      </div>
+    </section>
   );
 }
 
@@ -1285,6 +1441,7 @@ function QueueMiniStats({ item }) {
 function CleanupTab({
   adminToken,
   commitCleanupRows,
+  coverage,
   crossRowIssues,
   normalizeAllRows,
   pendingCleanupCount,
@@ -1323,7 +1480,10 @@ function CleanupTab({
           { label: "Same-row multi-stage", value: qaStats.multipleQueues },
           { label: "Duplicate in queue", value: qaStats.duplicateWithinQueue },
           { label: "Cross-worker conflicts", value: crossRowIssues.length },
-          { label: "Pending cleanup rows", value: pendingCleanupCount },
+          {
+            label: "Missing images",
+            value: coverage.fileCoverage.reduce((total, file) => total + file.missing.length, 0),
+          },
         ].map((item) => (
           <div key={item.label} className="rounded-md border border-slate-200 bg-white p-4 shadow-panel">
             <p className="text-sm font-medium text-slate-500">{item.label}</p>
@@ -1331,6 +1491,8 @@ function CleanupTab({
           </div>
         ))}
       </section>
+
+      <CoverageSection coverage={coverage} />
 
       <section className="rounded-md border border-slate-200 bg-white p-4 shadow-panel">
         <div className="grid gap-4 lg:grid-cols-[1fr_auto_auto_auto] lg:items-end">
